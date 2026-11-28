@@ -1,8 +1,8 @@
 const crypto = require('node:crypto');
 const express = require('express');
 const auth = require('../auth');
-const { HttpError, fullName } = require('../util');
-const { parseId, ensureConversation } = require('../domain');
+const { HttpError, fullName, toIsoDateTime } = require('../util');
+const { parseId, ensureConversation, byName, byText, getCourses } = require('../domain');
 
 const PASSWORD_ALPHABET = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 
@@ -32,236 +32,269 @@ function parseFullName(value) {
   return { lastNames: last, firstNames: first };
 }
 
-function validateStudentInput(db, body) {
+async function validateStudentInput(store, body) {
   const dni = String(body.dni || '').trim();
   if (!/^\d{8}$/.test(dni)) throw new HttpError(400, 'El DNI debe tener 8 dígitos.');
   const name = parseFullName(body.fullName);
   const sectionId = parseId(body.sectionId, 'sección');
-  if (!db.prepare('SELECT 1 FROM sections WHERE id = ?').get(sectionId)) throw new HttpError(400, 'La sección no existe.');
+  if (!(await store.get('sections', sectionId))) throw new HttpError(400, 'La sección no existe.');
   const guardianName = String(body.guardian?.fullName || '').trim().replace(/\s+/g, ' ');
   if (guardianName.length < 5) throw new HttpError(400, 'Ingresa el nombre completo del apoderado.');
   if (guardianName.length > 120) throw new HttpError(400, 'El nombre del apoderado es demasiado largo.');
   return { dni, ...name, sectionId, guardianName, phone: normalizePhone(body.guardian?.phone) };
 }
 
-module.exports = function adminRoutes(db) {
+module.exports = function adminRoutes(store) {
   const router = express.Router();
   router.use(auth.requireRole('direccion'));
 
-  const studentRow = `
-    SELECT s.id, s.dni, s.last_names, s.first_names, s.active, s.section_id AS sectionId, sec.name AS sectionName,
-           g.id AS guardianId, g.full_name AS guardianName, g.phone, g.consent_accepted_at AS consentAcceptedAt,
-           u.username AS guardianUsername
-    FROM students s
-    JOIN sections sec ON sec.id = s.section_id
-    LEFT JOIN guardians g ON g.student_id = s.id
-    LEFT JOIN users u ON u.id = g.user_id`;
-
-  const toStudent = (r) => ({
-    id: r.id,
-    dni: r.dni,
-    fullName: fullName(r),
-    active: Boolean(r.active),
-    sectionId: r.sectionId,
-    sectionName: r.sectionName,
-    guardian: r.guardianId
-      ? { id: r.guardianId, fullName: r.guardianName, phone: r.phone, username: r.guardianUsername }
-      : null,
-    consent: r.consentAcceptedAt ? 'Registrado' : 'Pendiente',
+  const toStudent = (student, section, guardian, user) => ({
+    id: student.id,
+    dni: student.dni,
+    fullName: fullName(student),
+    active: Boolean(student.active),
+    sectionId: student.section_id,
+    sectionName: section?.name,
+    guardian: guardian ? { id: guardian.id, fullName: guardian.full_name, phone: guardian.phone, username: user?.username } : null,
+    consent: guardian?.consent_accepted_at ? 'Registrado' : 'Pendiente',
   });
 
-  router.get('/students', (req, res) => {
+  /** Arma la vista completa de un estudiante (sección, apoderado y usuario). */
+  async function studentView(id) {
+    const student = await store.get('students', id);
+    const [section, guardian] = await Promise.all([
+      store.get('sections', student.section_id),
+      store.findOne('guardians', { student_id: id }),
+    ]);
+    const user = guardian ? await store.get('users', guardian.user_id) : null;
+    return toStudent(student, section, guardian, user);
+  }
+
+  router.get('/students', async (req, res) => {
     const pageSize = Math.min(Math.max(Number(req.query.pageSize) || 8, 1), 50);
     const page = Math.max(Number(req.query.page) || 1, 1);
     const status = ['active', 'inactive'].includes(req.query.status) ? req.query.status : 'all';
     const search = String(req.query.search || '').trim().toLowerCase();
 
-    const where = [];
-    const params = [];
-    if (status !== 'all') {
-      where.push('s.active = ?');
-      params.push(status === 'active' ? 1 : 0);
-    }
-    if (search) {
-      where.push("(s.dni LIKE ? OR lower(s.last_names || ' ' || s.first_names) LIKE ? OR lower(g.full_name) LIKE ?)");
-      const like = `%${search.replace(/[%_]/g, '')}%`;
-      params.push(like, like, like);
-    }
-    const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-    const total = db
-      .prepare(`SELECT COUNT(*) AS n FROM students s LEFT JOIN guardians g ON g.student_id = s.id ${clause}`)
-      .get(...params).n;
-    const items = db
-      .prepare(`${studentRow} ${clause} ORDER BY s.last_names, s.first_names LIMIT ? OFFSET ?`)
-      .all(...params, pageSize, (page - 1) * pageSize)
-      .map(toStudent);
-    const totals = db
-      .prepare(`
-        SELECT SUM(s.active = 1) AS active,
-               SUM(s.active = 1 AND g.consent_accepted_at IS NOT NULL) AS consents
-        FROM students s LEFT JOIN guardians g ON g.student_id = s.id`)
-      .get();
+    const [students, guardians, sections] = await Promise.all([
+      store.find('students'),
+      store.find('guardians'),
+      store.find('sections'),
+    ]);
+    const guardianByStudent = new Map(guardians.map((g) => [g.student_id, g]));
+    const sectionById = new Map(sections.map((s) => [s.id, s]));
+
+    const matching = students
+      .filter((s) => (status === 'all' ? true : status === 'active' ? s.active : !s.active))
+      .filter((s) => {
+        if (!search) return true;
+        const guardianName = guardianByStudent.get(s.id)?.full_name || '';
+        return (
+          s.dni.includes(search) ||
+          `${s.last_names} ${s.first_names}`.toLowerCase().includes(search) ||
+          guardianName.toLowerCase().includes(search)
+        );
+      })
+      .sort(byName);
+    const pageItems = matching.slice((page - 1) * pageSize, page * pageSize);
+    const users = new Map(
+      (await store.getMany('users', pageItems.map((s) => guardianByStudent.get(s.id)?.user_id).filter(Boolean))).map((u) => [u.id, u]),
+    );
+
+    const active = students.filter((s) => s.active);
     res.json({
-      items,
-      total,
+      items: pageItems.map((s) => {
+        const guardian = guardianByStudent.get(s.id);
+        return toStudent(s, sectionById.get(s.section_id), guardian, guardian && users.get(guardian.user_id));
+      }),
+      total: matching.length,
       page,
       pageSize,
-      activeCount: totals.active || 0,
-      consentCount: totals.consents || 0,
+      activeCount: active.length,
+      consentCount: active.filter((s) => guardianByStudent.get(s.id)?.consent_accepted_at).length,
     });
   });
 
-  router.get('/sections-list', (req, res) => {
-    res.json({ sections: db.prepare('SELECT id, name, grade FROM sections ORDER BY name').all() });
+  router.get('/sections-list', async (req, res) => {
+    const sections = (await store.find('sections')).sort(byText('name'));
+    res.json({ sections: sections.map((s) => ({ id: s.id, name: s.name, grade: s.grade })) });
   });
 
-  function assertUniqueDni(dni, ignoreId = 0) {
-    const clash = db.prepare('SELECT id, first_names, last_names FROM students WHERE dni = ? AND id <> ?').get(dni, ignoreId);
-    if (clash) {
+  async function assertUniqueDni(dni, ignoreId = 0) {
+    const clash = await store.findOne('students', { dni });
+    if (clash && clash.id !== ignoreId) {
       throw new HttpError(409, `Ya existe un estudiante con este DNI (${clash.first_names} ${clash.last_names}).`);
     }
   }
 
-  function uniqueUsername(base) {
+  async function uniqueUsername(base) {
     let candidate = base;
-    for (let n = 2; db.prepare('SELECT 1 FROM users WHERE username = ?').get(candidate); n += 1) {
-      candidate = `${base}${n}`;
-    }
+    for (let n = 2; await store.findOne('users', { username: candidate }); n += 1) candidate = `${base}${n}`;
     return candidate;
   }
 
-  router.post('/students', (req, res) => {
-    const input = validateStudentInput(db, req.body || {});
-    assertUniqueDni(input.dni);
+  router.post('/students', async (req, res) => {
+    const input = await validateStudentInput(store, req.body || {});
+    await assertUniqueDni(input.dni);
     const password = temporaryPassword();
-    const username = uniqueUsername(baseUsername(input.guardianName));
+    const username = await uniqueUsername(baseUsername(input.guardianName));
+    const now = toIsoDateTime(new Date());
 
-    const studentId = db.transaction(() => {
-      const id = db
-        .prepare('INSERT INTO students (dni, last_names, first_names, section_id) VALUES (?, ?, ?, ?)')
-        .run(input.dni, input.lastNames, input.firstNames, input.sectionId).lastInsertRowid;
-      const userId = db
-        .prepare("INSERT INTO users (username, password_hash, role, full_name) VALUES (?, ?, 'apoderado', ?)")
-        .run(username, auth.hashPassword(password), input.guardianName).lastInsertRowid;
-      const guardianId = db
-        .prepare('INSERT INTO guardians (user_id, student_id, full_name, phone) VALUES (?, ?, ?, ?)')
-        .run(userId, id, input.guardianName, input.phone).lastInsertRowid;
-      ensureConversation(db, guardianId);
-      return id;
-    })();
+    const studentId = await store.insert('students', {
+      dni: input.dni,
+      last_names: input.lastNames,
+      first_names: input.firstNames,
+      section_id: input.sectionId,
+      active: true,
+      created_at: now,
+      updated_at: now,
+    });
+    const userId = await store.insert('users', {
+      username,
+      password_hash: auth.hashPassword(password),
+      role: 'apoderado',
+      full_name: input.guardianName,
+      title: null,
+      active: true,
+      created_at: now,
+    });
+    const guardianId = await store.insert('guardians', {
+      user_id: userId,
+      student_id: studentId,
+      full_name: input.guardianName,
+      phone: input.phone,
+      relationship: null,
+      consent_accepted_at: null,
+      notifications_enabled: false,
+    });
+    await ensureConversation(store, guardianId);
+    store.clearCache('report:');
 
-    const created = toStudent(db.prepare(`${studentRow} WHERE s.id = ?`).get(studentId));
-    res.status(201).json({ student: created, credentials: { username, temporaryPassword: password } });
+    res.status(201).json({ student: await studentView(studentId), credentials: { username, temporaryPassword: password } });
   });
 
-  router.put('/students/:id', (req, res) => {
+  router.put('/students/:id', async (req, res) => {
     const id = parseId(req.params.id, 'estudiante');
-    const current = db.prepare('SELECT id FROM students WHERE id = ?').get(id);
-    if (!current) throw new HttpError(404, 'Estudiante no encontrado.');
-    const input = validateStudentInput(db, req.body || {});
-    assertUniqueDni(input.dni, id);
+    if (!(await store.get('students', id))) throw new HttpError(404, 'Estudiante no encontrado.');
+    const input = await validateStudentInput(store, req.body || {});
+    await assertUniqueDni(input.dni, id);
 
-    db.transaction(() => {
-      db.prepare(
-        "UPDATE students SET dni = ?, last_names = ?, first_names = ?, section_id = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
-      ).run(input.dni, input.lastNames, input.firstNames, input.sectionId, id);
-      const guardian = db.prepare('SELECT id, user_id FROM guardians WHERE student_id = ?').get(id);
-      if (guardian) {
-        db.prepare('UPDATE guardians SET full_name = ?, phone = ? WHERE id = ?').run(input.guardianName, input.phone, guardian.id);
-        db.prepare('UPDATE users SET full_name = ? WHERE id = ?').run(input.guardianName, guardian.user_id);
-      }
-    })();
-    res.json({ student: toStudent(db.prepare(`${studentRow} WHERE s.id = ?`).get(id)) });
+    await store.update('students', id, {
+      dni: input.dni,
+      last_names: input.lastNames,
+      first_names: input.firstNames,
+      section_id: input.sectionId,
+      updated_at: toIsoDateTime(new Date()),
+    });
+    const guardian = await store.findOne('guardians', { student_id: id });
+    if (guardian) {
+      await store.update('guardians', guardian.id, { full_name: input.guardianName, phone: input.phone });
+      await store.update('users', guardian.user_id, { full_name: input.guardianName });
+    }
+    store.clearCache('report:');
+    res.json({ student: await studentView(id) });
   });
 
   /** Activar / desactivar (no se eliminan estudiantes para conservar su historial). */
-  router.patch('/students/:id/active', (req, res) => {
+  router.patch('/students/:id/active', async (req, res) => {
     const id = parseId(req.params.id, 'estudiante');
     if (typeof req.body?.active !== 'boolean') throw new HttpError(400, 'Indica si el estudiante queda activo.');
-    const active = req.body.active ? 1 : 0;
-    const exists = db.prepare('SELECT id FROM students WHERE id = ?').get(id);
-    if (!exists) throw new HttpError(404, 'Estudiante no encontrado.');
-    db.transaction(() => {
-      db.prepare("UPDATE students SET active = ?, updated_at = datetime('now', 'localtime') WHERE id = ?").run(active, id);
-      const guardian = db.prepare('SELECT user_id FROM guardians WHERE student_id = ?').get(id);
-      if (guardian) {
-        db.prepare('UPDATE users SET active = ? WHERE id = ?').run(active, guardian.user_id);
-        if (!active) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(guardian.user_id);
-      }
-    })();
-    res.json({ student: toStudent(db.prepare(`${studentRow} WHERE s.id = ?`).get(id)) });
+    const active = req.body.active;
+    if (!(await store.get('students', id))) throw new HttpError(404, 'Estudiante no encontrado.');
+    await store.update('students', id, { active, updated_at: toIsoDateTime(new Date()) });
+    const guardian = await store.findOne('guardians', { student_id: id });
+    if (guardian) {
+      await store.update('users', guardian.user_id, { active });
+      if (!active) await store.removeWhere('sessions', { user_id: guardian.user_id });
+    }
+    store.clearCache('report:');
+    res.json({ student: await studentView(id) });
   });
 
-  router.post('/students/:id/guardian/reset-password', (req, res) => {
+  router.post('/students/:id/guardian/reset-password', async (req, res) => {
     const id = parseId(req.params.id, 'estudiante');
-    const guardian = db
-      .prepare('SELECT g.user_id AS userId, u.username FROM guardians g JOIN users u ON u.id = g.user_id WHERE g.student_id = ?')
-      .get(id);
-    if (!guardian) throw new HttpError(404, 'El estudiante no tiene apoderado registrado.');
+    const guardian = await store.findOne('guardians', { student_id: id });
+    const user = guardian && (await store.get('users', guardian.user_id));
+    if (!user) throw new HttpError(404, 'El estudiante no tiene apoderado registrado.');
     const password = temporaryPassword();
-    db.transaction(() => {
-      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(auth.hashPassword(password), guardian.userId);
-      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(guardian.userId);
-    })();
-    res.json({ credentials: { username: guardian.username, temporaryPassword: password } });
+    await store.update('users', user.id, { password_hash: auth.hashPassword(password) });
+    await store.removeWhere('sessions', { user_id: user.id });
+    res.json({ credentials: { username: user.username, temporaryPassword: password } });
   });
 
-  router.get('/teachers', (req, res) => {
-    const teachers = db.prepare("SELECT id, username, full_name AS fullName, title, active FROM users WHERE role = 'docente' ORDER BY full_name").all();
-    const assignments = db
-      .prepare(`
-        SELECT ta.teacher_id AS teacherId, c.name AS course, sec.name AS section
-        FROM teaching_assignments ta JOIN courses c ON c.id = ta.course_id JOIN sections sec ON sec.id = ta.section_id
-        ORDER BY c.id`)
-      .all();
-    const tutorships = db.prepare('SELECT tutor_id AS teacherId, name FROM sections WHERE tutor_id IS NOT NULL').all();
+  router.get('/teachers', async (req, res) => {
+    const [teachers, assignments, sections, courses] = await Promise.all([
+      store.find('users', { where: { role: 'docente' } }),
+      store.find('teaching_assignments'),
+      store.find('sections'),
+      getCourses(store),
+    ]);
+    const courseName = new Map(courses.map((c) => [c.id, c]));
+    const sectionName = new Map(sections.map((s) => [s.id, s.name]));
     res.json({
-      teachers: teachers.map((t) => ({
-        ...t,
-        active: Boolean(t.active),
-        assignments: assignments.filter((a) => a.teacherId === t.id).map((a) => ({ course: a.course, section: a.section })),
-        tutorOf: tutorships.filter((s) => s.teacherId === t.id).map((s) => s.name),
+      teachers: teachers
+        .sort((a, b) => a.full_name.localeCompare(b.full_name, 'es'))
+        .map((t) => ({
+          id: t.id,
+          username: t.username,
+          fullName: t.full_name,
+          title: t.title,
+          active: Boolean(t.active),
+          assignments: assignments
+            .filter((a) => a.teacher_id === t.id)
+            .sort((a, b) => a.course_id - b.course_id)
+            .map((a) => ({ course: courseName.get(a.course_id).name, section: sectionName.get(a.section_id) })),
+          tutorOf: sections.filter((s) => s.tutor_id === t.id).map((s) => s.name),
+        })),
+    });
+  });
+
+  router.get('/sections', async (req, res) => {
+    const [sections, students, assignments, users, courses] = await Promise.all([
+      store.find('sections'),
+      store.find('students', { where: { active: true } }),
+      store.find('teaching_assignments'),
+      store.find('users', { where: { role: 'docente' } }),
+      getCourses(store),
+    ]);
+    const teacherName = new Map(users.map((u) => [u.id, u.full_name]));
+    const courseName = new Map(courses.map((c) => [c.id, c.name]));
+    res.json({
+      sections: sections.sort(byText('name')).map((s) => ({
+        id: s.id,
+        name: s.name,
+        grade: s.grade,
+        schoolYear: s.school_year,
+        tutorName: teacherName.get(s.tutor_id) ?? null,
+        students: students.filter((st) => st.section_id === s.id).length,
+        courses: assignments
+          .filter((a) => a.section_id === s.id)
+          .sort((a, b) => a.course_id - b.course_id)
+          .map((a) => ({ id: a.course_id, name: courseName.get(a.course_id), teacherName: teacherName.get(a.teacher_id) })),
       })),
     });
   });
 
-  router.get('/sections', (req, res) => {
-    const sections = db
-      .prepare(`
-        SELECT sec.id, sec.name, sec.grade, sec.school_year AS schoolYear, u.full_name AS tutorName,
-               (SELECT COUNT(*) FROM students s WHERE s.section_id = sec.id AND s.active = 1) AS students
-        FROM sections sec LEFT JOIN users u ON u.id = sec.tutor_id ORDER BY sec.name`)
-      .all();
-    const courses = db
-      .prepare(`
-        SELECT ta.section_id AS sectionId, c.id AS courseId, c.name AS course, u.full_name AS teacherName
-        FROM teaching_assignments ta JOIN courses c ON c.id = ta.course_id JOIN users u ON u.id = ta.teacher_id
-        ORDER BY c.id`)
-      .all();
+  router.get('/consents', async (req, res) => {
+    const [students, guardians] = await Promise.all([store.find('students', { where: { active: true } }), store.find('guardians')]);
+    const guardianByStudent = new Map(guardians.map((g) => [g.student_id, g]));
+    const rows = students
+      .filter((s) => guardianByStudent.has(s.id))
+      .sort((a, b) => {
+        const pending = (s) => (guardianByStudent.get(s.id).consent_accepted_at ? 0 : 1);
+        return pending(b) - pending(a) || byName(a, b);
+      });
     res.json({
-      sections: sections.map((s) => ({
-        ...s,
-        courses: courses.filter((c) => c.sectionId === s.id).map((c) => ({ id: c.courseId, name: c.course, teacherName: c.teacherName })),
-      })),
-    });
-  });
-
-  router.get('/consents', (req, res) => {
-    const rows = db
-      .prepare(`
-        SELECT s.last_names, s.first_names, g.full_name AS guardianName, g.phone,
-               g.consent_accepted_at AS acceptedAt, g.notifications_enabled AS notificationsEnabled
-        FROM guardians g JOIN students s ON s.id = g.student_id
-        WHERE s.active = 1 ORDER BY (g.consent_accepted_at IS NULL) DESC, s.last_names, s.first_names`)
-      .all();
-    res.json({
-      items: rows.map((r) => ({
-        studentName: fullName(r),
-        guardianName: r.guardianName,
-        phone: r.phone,
-        acceptedAt: r.acceptedAt,
-        notificationsEnabled: Boolean(r.notificationsEnabled),
-      })),
+      items: rows.map((s) => {
+        const g = guardianByStudent.get(s.id);
+        return {
+          studentName: fullName(s),
+          guardianName: g.full_name,
+          phone: g.phone,
+          acceptedAt: g.consent_accepted_at ?? null,
+          notificationsEnabled: Boolean(g.notifications_enabled),
+        };
+      }),
     });
   });
 

@@ -1,17 +1,20 @@
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
-const { openDatabase } = require('../src/db');
+const { MemoryStore } = require('../src/store/memory');
+const { openStore } = require('../src/store');
 const { createApp } = require('../src/app');
 const { seed, DEMO_PASSWORD } = require('../src/seed');
 
 let server;
 let base;
-let db;
+let store;
 
 before(async () => {
-  db = openDatabase(':memory:');
-  seed(db);
-  server = createApp(db).listen(0);
+  // Con FIRESTORE_EMULATOR_HOST definido las pruebas corren contra el emulador de Firestore; si no, en memoria.
+  store = process.env.FIRESTORE_EMULATOR_HOST ? openStore() : new MemoryStore();
+  await store.wipe();
+  await seed(store);
+  server = createApp(store).listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
   base = `http://127.0.0.1:${server.address().port}`;
 });
@@ -33,6 +36,7 @@ function client() {
     return { status: res.status, data };
   };
   return {
+    cookie: async () => cookie,
     get: (path) => call('GET', path),
     post: (path, body) => call('POST', path, body ?? {}),
     put: (path, body) => call('PUT', path, body),
@@ -214,4 +218,52 @@ test('el reporte de rendimiento identifica a los estudiantes en riesgo', async (
     headers: { cookie: '' },
   });
   assert.equal(xlsx.status, 401, 'la exportación también exige sesión');
+});
+
+test('los mensajes mantienen el último mensaje y los no leídos de cada lado', async () => {
+  const teacher = client();
+  const parent = client();
+  await teacher.login('docente', 'rhuaman');
+  await parent.login('apoderado', 'rquispe');
+
+  const before = await parent.get('/api/badges');
+  const sent = await teacher.post('/api/conversations/1/messages', { body: 'Hola, buenas tardes.' });
+  assert.equal(sent.status, 201);
+
+  const badges = await parent.get('/api/badges');
+  assert.equal(badges.data.messages, before.data.messages + 1);
+  assert.equal(badges.data.notifications > 0, true);
+
+  const list = await parent.get('/api/conversations');
+  assert.equal(list.data.conversations[0].lastBody, 'Hola, buenas tardes.');
+  assert.equal(list.data.conversations[0].unread, 1);
+
+  const thread = await parent.get('/api/conversations/me/messages');
+  assert.equal(thread.data.messages.at(-1).body, 'Hola, buenas tardes.');
+  assert.equal((await parent.get('/api/badges')).data.messages, 0, 'leer la conversación limpia el contador');
+
+  await parent.post('/api/conversations/me/messages', { body: 'Gracias, profesora.' });
+  const inbox = await teacher.get('/api/conversations');
+  const row = inbox.data.conversations.find((c) => c.guardianName === 'Rocío Quispe Mamani');
+  assert.equal(row.unread, 1);
+  assert.equal(row.lastBody, 'Gracias, profesora.');
+});
+
+test('el apoderado registra y elimina el token de notificaciones push', async () => {
+  const parent = client();
+  await parent.login('apoderado', 'rquispe');
+  const config = await parent.get('/api/guardian/push/config');
+  assert.equal(config.data.enabled, false, 'sin Firebase configurado el push queda desactivado');
+  const token = 'x'.repeat(152);
+  assert.equal((await parent.post('/api/guardian/push/token', { token: 'corto' })).status, 400);
+  assert.equal((await parent.post('/api/guardian/push/token', { token })).status, 201);
+  const devices = await store.find('device_tokens');
+  assert.equal(devices.length, 1);
+  const res = await fetch(`${base}/api/guardian/push/token`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json', cookie: (await parent.cookie()) },
+    body: JSON.stringify({ token }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal((await store.find('device_tokens')).length, 0);
 });

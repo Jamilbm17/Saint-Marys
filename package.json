@@ -8,15 +8,16 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js",
-    "seed": "node src/seed.js",
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "node --watch --env-file-if-exists=.env server.js",
+    "seed": "node --env-file-if-exists=.env src/seed.js",
+    "seed:bulk": "node --env-file-if-exists=.env src/seed-bulk.js",
     "test": "node --test"
   },
   "license": "UNLICENSED",
   "dependencies": {
-    "better-sqlite3": "^13.2.0",
     "exceljs": "^4.4.0",
-    "express": "^5.3.0"
+    "express": "^5.3.0",
+    "firebase-admin": "^14.5.1"
   }
 }

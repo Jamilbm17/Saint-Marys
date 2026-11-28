@@ -1,6 +1,6 @@
 import {
   api, qs, $, $$, html, raw, setHtml, icon, toast, withBusy, debounce, initials, fmtDate, fmtLongDate, fmtTime, fmtRelative,
-  fmtNumber, ATTENDANCE,
+  fmtNumber, ATTENDANCE, whatsappUrl,
 } from '../lib.js';
 import { threadHtml, scrollToEnd } from './chat.js';
 
@@ -505,6 +505,7 @@ async function mensajes(root, ctx) {
         <div class="chat-head">
           <span class="avatar lg">${initials(data.guardian.name)}</span>
           <div class="who"><strong style="font-size:15px">${data.guardian.name}</strong><span>Apoderado de ${data.student.fullName} · ${data.student.sectionName}</span></div>
+          ${whatsappUrl(data.guardian.phone) ? html`<a class="btn btn-ghost" style="margin-left:auto" href="${whatsappUrl(data.guardian.phone)}" target="_blank" rel="noopener noreferrer" aria-label="Abrir WhatsApp con el apoderado">WhatsApp</a>` : ''}
         </div>
         <div class="thread" id="thread">${threadHtml(data.messages, today, 'docente')}</div>
         <form class="composer" id="composer">

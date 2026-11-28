@@ -18,7 +18,16 @@ function securityHeaders(req, res, next) {
   res.setHeader('Referrer-Policy', 'same-origin');
   res.setHeader(
     'Content-Security-Policy',
-    "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'",
+    [
+      "default-src 'self'",
+      "img-src 'self' data:",
+      "style-src 'self' 'unsafe-inline'",
+      // SDK de Firebase Messaging (notificaciones push) servido desde el CDN de Google
+      "script-src 'self' https://www.gstatic.com",
+      "connect-src 'self' https://*.googleapis.com https://fcmregistrations.googleapis.com https://firebaseinstallations.googleapis.com",
+      "worker-src 'self'",
+      "frame-ancestors 'none'",
+    ].join('; '),
   );
   next();
 }
@@ -31,13 +40,13 @@ function requireJsonForWrites(req, res, next) {
   next();
 }
 
-function createApp(db) {
+function createApp(store) {
   const app = express();
   app.disable('x-powered-by');
-  app.set('trust proxy', 'loopback');
+  app.set('trust proxy', Number.isNaN(Number(config.trustProxy)) ? config.trustProxy : Number(config.trustProxy));
   app.use(securityHeaders);
   app.use(express.json({ limit: '100kb' }));
-  app.use(auth.authenticate(db));
+  app.use(auth.authenticate(store));
 
   const api = express.Router();
   api.use((req, res, next) => {
@@ -45,15 +54,15 @@ function createApp(db) {
     next();
   });
   api.use(requireJsonForWrites);
-  api.use('/auth', authRoutes(db));
-  api.use('/meta', authRoutes.metaRoute(db));
-  api.use('/teacher', attendanceRoutes(db));
-  api.use('/teacher', gradesRoutes(db));
-  api.use('/teacher', conductRoutes(db));
-  api.use('/', messagesRoutes(db));
-  api.use('/guardian', guardianRoutes(db));
-  api.use('/admin', adminRoutes(db));
-  api.use('/reports', reportsRoutes(db));
+  api.use('/auth', authRoutes(store));
+  api.use('/meta', authRoutes.metaRoute(store));
+  api.use('/teacher', attendanceRoutes(store));
+  api.use('/teacher', gradesRoutes(store));
+  api.use('/teacher', conductRoutes(store));
+  api.use('/', messagesRoutes(store));
+  api.use('/guardian', guardianRoutes(store));
+  api.use('/admin', adminRoutes(store));
+  api.use('/reports', reportsRoutes(store));
   api.use((req, res, next) => next(new HttpError(404, 'Recurso no encontrado.')));
   app.use('/api', api);
 

@@ -218,3 +218,10 @@ export async function withBusy(button, action) {
     button.disabled = false;
   }
 }
+
+/** Enlace "click to chat" de WhatsApp (gratuito, sin API): el personal inicia la conversación a mano. */
+export function whatsappUrl(phone, text = '') {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length !== 9) return null;
+  return `https://wa.me/51${digits}${text ? `?text=${encodeURIComponent(text)}` : ''}`;
+}

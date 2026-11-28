@@ -7,11 +7,11 @@ const config = require('../config');
 const ROLE_LABELS = { docente: 'Docente', direccion: 'Dirección', apoderado: 'Apoderado' };
 const DUMMY_HASH = auth.hashPassword('contraseña-inexistente');
 
-module.exports = function authRoutes(db) {
+module.exports = function authRoutes(store) {
   const router = express.Router();
   const limiter = auth.createLoginLimiter();
 
-  function describeUser(req) {
+  async function describeUser(req) {
     const { user } = req;
     const base = {
       id: user.id,
@@ -21,11 +21,8 @@ module.exports = function authRoutes(db) {
     };
     if (user.role !== 'apoderado') return base;
     const g = req.guardian;
-    const student = db
-      .prepare(`
-        SELECT s.id, s.last_names, s.first_names, sec.name AS sectionName, sec.grade
-        FROM students s JOIN sections sec ON sec.id = s.section_id WHERE s.id = ?`)
-      .get(g.studentId);
+    const student = await store.get('students', g.studentId);
+    const section = await store.get('sections', student.section_id);
     return {
       ...base,
       guardian: {
@@ -37,60 +34,55 @@ module.exports = function authRoutes(db) {
           id: student.id,
           fullName: `${student.first_names} ${student.last_names}`,
           shortName: student.first_names,
-          sectionName: student.sectionName,
-          grade: student.grade,
+          sectionName: section.name,
+          grade: section.grade,
         },
       },
     };
   }
 
-  router.post('/login', (req, res) => {
+  router.post('/login', async (req, res) => {
     const { role, username, password } = req.body || {};
     if (typeof username !== 'string' || typeof password !== 'string' || !username.trim() || !password) {
       throw new HttpError(400, 'Ingresa tu usuario y contraseña.');
     }
     limiter.check(req, username);
-    const user = db.prepare('SELECT * FROM users WHERE username = ? AND active = 1').get(username.trim());
+    const found = await store.findOne('users', { username: username.trim().toLowerCase() });
+    const user = found?.active ? found : null;
     const valid = auth.verifyPassword(password, user ? user.password_hash : DUMMY_HASH);
     if (!user || !valid || (role && user.role !== role)) {
       limiter.fail(req, username);
       throw new HttpError(401, 'Usuario o contraseña incorrectos para el perfil seleccionado.');
     }
     limiter.reset(req, username);
-    const { token, expires, persistent } = auth.createSession(db, user.id, { remember: req.body.remember === true });
+    const { token, expires, persistent } = await auth.createSession(store, user.id, { remember: req.body.remember === true });
     auth.setSessionCookie(res, token, expires, persistent);
     req.user = { id: user.id, role: user.role, fullName: user.full_name, title: user.title };
     if (user.role === 'apoderado') {
-      req.guardian = db
-        .prepare(`
-          SELECT id, student_id AS studentId, full_name AS fullName, phone,
-                 consent_accepted_at AS consentAcceptedAt, notifications_enabled AS notificationsEnabled
-          FROM guardians WHERE user_id = ?`)
-        .get(user.id);
+      req.guardian = auth.guardianView(await store.findOne('guardians', { user_id: user.id }));
     }
-    res.json({ user: describeUser(req) });
+    res.json({ user: await describeUser(req) });
   });
 
-  router.post('/logout', (req, res) => {
-    auth.destroySession(db, req.sessionToken);
+  router.post('/logout', async (req, res) => {
+    await auth.destroySession(store, req.sessionToken);
     auth.clearSessionCookie(res);
     res.json({ ok: true });
   });
 
-  router.get('/me', auth.requireAuth, (req, res) => {
-    res.json({ user: describeUser(req) });
+  router.get('/me', auth.requireAuth, async (req, res) => {
+    res.json({ user: await describeUser(req) });
   });
 
-  router.post('/consent', auth.requireRole('apoderado'), (req, res) => {
+  router.post('/consent', auth.requireRole('apoderado'), async (req, res) => {
     const { dataConsent, notificationsConsent } = req.body || {};
     if (dataConsent !== true) {
       throw new HttpError(400, 'Debes autorizar el tratamiento de datos para continuar.');
     }
-    db.prepare('UPDATE guardians SET consent_accepted_at = ?, notifications_enabled = ? WHERE id = ?').run(
-      toIsoDateTime(new Date()),
-      notificationsConsent === true ? 1 : 0,
-      req.guardian.id,
-    );
+    await store.update('guardians', req.guardian.id, {
+      consent_accepted_at: toIsoDateTime(new Date()),
+      notifications_enabled: notificationsConsent === true,
+    });
     res.json({ ok: true });
   });
 
@@ -98,14 +90,14 @@ module.exports = function authRoutes(db) {
 };
 
 /** Datos globales de la aplicación (año escolar, bimestres, fecha de referencia). */
-module.exports.metaRoute = function metaRoute(db) {
+module.exports.metaRoute = function metaRoute(store) {
   const router = express.Router();
-  router.get('/', auth.requireAuth, (req, res) => {
+  router.get('/', auth.requireAuth, async (req, res) => {
     const now = new Date();
-    const current = resolveCurrentTerm(db, now);
+    const current = await resolveCurrentTerm(store, now);
     res.json({
       schoolYear: config.schoolYear,
-      terms: getTerms(db),
+      terms: await getTerms(store),
       currentTerm: current.code,
       today: toIsoDate(now),
       defaultDate: toIsoDate(lastWeekday(now)),

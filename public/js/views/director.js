@@ -1,5 +1,5 @@
 import {
-  api, qs, $, $$, html, raw, setHtml, icon, toast, withBusy, debounce, fmtDate, fmtTime, fmtNumber, initials,
+  api, qs, $, $$, html, raw, setHtml, icon, toast, withBusy, debounce, fmtDate, fmtTime, fmtNumber, initials, whatsappUrl,
 } from '../lib.js';
 
 // ---------- Diálogo reutilizable ----------
@@ -404,7 +404,7 @@ function contactDialog(risk, ctx) {
     html`
       <form class="dialog-body" id="contact-form">
         <h2>Contactar apoderado</h2>
-        <p class="muted" style="font-size:14px"><strong style="color:var(--ink)">${risk.guardian.name}</strong> · apoderado de ${risk.name}<br>Celular: ${risk.guardian.phone}</p>
+        <p class="muted" style="font-size:14px"><strong style="color:var(--ink)">${risk.guardian.name}</strong> · apoderado de ${risk.name}<br>Celular: ${risk.guardian.phone}${whatsappUrl(risk.guardian.phone) ? html` · <a href="${whatsappUrl(risk.guardian.phone)}" target="_blank" rel="noopener noreferrer">Abrir WhatsApp</a>` : ''}</p>
         <label class="field" for="contact-body">Mensaje
           <textarea class="textarea" id="contact-body" rows="4" maxlength="2000" required placeholder="Escribe el mensaje para el apoderado"></textarea>
         </label>

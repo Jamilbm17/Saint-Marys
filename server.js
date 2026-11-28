@@ -1,14 +1,29 @@
 const config = require('./src/config');
-const { openDatabase } = require('./src/db');
+const { openStore } = require('./src/store');
 const { createApp } = require('./src/app');
+const { pushEnabled } = require('./src/push');
 
-const db = openDatabase();
+async function main() {
+  const store = openStore();
+  const empty = !(await store.findOne('users', { role: 'direccion' }));
 
-if (db.prepare('SELECT COUNT(*) AS n FROM users').get().n === 0) {
-  console.log('Base de datos vacía: cargando datos de demostración…');
-  require('./src/seed').seed(db);
+  if (store.kind === 'memory') {
+    console.log('Sin credenciales de Firebase: usando almacén en memoria con datos de demostración (se pierden al reiniciar).');
+    await require('./src/seed').seed(store);
+  } else if (empty && process.env.AUTO_SEED === 'true') {
+    console.log('Firestore vacío y AUTO_SEED=true: cargando datos de demostración…');
+    await require('./src/seed').seed(store);
+  } else if (empty) {
+    console.log('Aviso: Firestore está vacío. Ejecuta "npm run seed" para cargar los datos de demostración.');
+  }
+
+  createApp(store).listen(config.port, () => {
+    console.log(`Saint Mary's · Control Académico en http://localhost:${config.port}`);
+    console.log(`  Datos: ${store.kind === 'firestore' ? 'Cloud Firestore' : 'memoria'} · Push FCM: ${pushEnabled() ? 'activo' : 'desactivado'}`);
+  });
 }
 
-createApp(db).listen(config.port, () => {
-  console.log(`Saint Mary's · Control Académico en http://localhost:${config.port}`);
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
 });

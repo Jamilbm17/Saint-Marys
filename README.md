@@ -1,7 +1,7 @@
 # Sistema de Control Académico · College Saint Mary's
 
 Aplicación web para registrar **asistencia, notas y conducta** y avisar a los apoderados el mismo día.
-Implementa las pantallas del diseño (10 capturas) con datos de demostración ficticios en **SQLite**.
+Implementa las pantallas del diseño (10 capturas) con datos de demostración ficticios sobre **Cloud Firestore** (o memoria para probar sin cuenta).
 
 ## Perfiles y pantallas
 
@@ -23,12 +23,14 @@ npm install
 npm start
 ```
 
-Abre <http://localhost:3000>. Si la base está vacía, el servidor carga los datos de demostración
-automáticamente en `data/saint-marys.db` (el archivo no se sube a Git).
+Abre <http://localhost:3000>. **Sin credenciales de Firebase** la app usa un almacén en memoria con los datos de
+demostración (se pierden al reiniciar). Para usar Firestore y las notificaciones push sigue
+las variables de `.env.example` (copia a `.env`): cuenta de servicio de Firestore y configuración web/VAPID de FCM.
 
 ```bash
-npm run seed -- --reset   # borra y vuelve a cargar los datos de demostración
-npm test                  # pruebas de la API (Node test runner, base en memoria)
+npm run seed -- --reset   # borra Firestore y carga los datos de demostración
+npm run seed:bulk         # suma 4 secciones x 30 estudiantes (`--sections`, `--students`, `--terms`; estima las escrituras: el plan gratuito permite 20 000/día)
+npm test                  # pruebas de la API (memoria; contra Firestore si FIRESTORE_EMULATOR_HOST está definido)
 ```
 
 ### Cuentas de demostración
@@ -59,6 +61,10 @@ y Gael Soto en riesgo, Joaquín Navarro con tardanza hoy, etc.
 - **Estudiantes**: DNI único (8 dígitos). Al registrar un estudiante se crea el usuario del apoderado con una
   contraseña temporal que se muestra una sola vez. Los estudiantes **no se eliminan**: se activan/desactivan
   y se conserva su historial.
+- **Notificaciones push**: además del aviso en la plataforma, el apoderado puede activar notificaciones en su celular
+  (Firebase Cloud Messaging) desde *Avisos*. Solo se envían con consentimiento y notificaciones activadas.
+- **WhatsApp**: el informe descarta la API comercial de WhatsApp (decisión CC04, por costo). Se incluye solo un enlace
+  gratuito «click to chat» (`wa.me`) para que docentes y Dirección abran WhatsApp con el apoderado manualmente.
 - **Reportes**: promedios, asistencia por bimestre, notificaciones y estudiantes en riesgo (promedio < 11 o
   más de 3 faltas injustificadas). "Exportar Excel" genera un `.xlsx`; "Exportar PDF" usa la impresión del
   navegador (Guardar como PDF).
@@ -66,11 +72,12 @@ y Gael Soto en riesgo, Joaquín Navarro con tardanza hoy, etc.
 ## Estructura
 
 ```
-server.js            arranque (crea la base y carga datos si está vacía)
+server.js            arranque (abre el almacén; en memoria carga la demostración)
 src/
   app.js             Express: cabeceras de seguridad, rutas, errores
-  db.js, schema.sql  conexión y esquema SQLite
-  seed.js            datos de demostración
+  store/             almacén de datos: firestore.js (producción) y memory.js (pruebas/local)
+  firebase.js, push.js  firebase-admin y notificaciones FCM
+  seed.js, seed-bulk.js datos de demostración y carga masiva
   auth.js            contraseñas (scrypt), sesiones, roles, consentimiento
   domain.js          reglas compartidas (permisos por sección, notificaciones, indicadores)
   routes/            auth, attendance, grades, conduct, messages, guardian, admin, reports
@@ -87,8 +94,9 @@ test/api.test.js     pruebas de la API
 
 ## Alcance actual y pendientes
 
-- Las notificaciones se entregan **dentro de la plataforma** (campana y avisos). No hay integración con
-  push móvil, correo ni WhatsApp.
+- Las notificaciones se entregan dentro de la plataforma y por **push (FCM)** cuando está configurado. No hay
+  correo ni API de WhatsApp (fuera del alcance del informe).
+- Autenticación propia (usuario + contraseña, sesiones en Firestore); no se usa Firebase Authentication.
 - Docentes y cursos/secciones son de **solo lectura** en Dirección (se cargan desde `src/seed.js`).
 - Un apoderado por estudiante.
 - Sin recuperación de contraseña por correo: Dirección restablece la contraseña desde *Estudiantes*.

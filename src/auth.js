@@ -21,19 +21,19 @@ function verifyPassword(password, stored) {
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
 
 /** Con "recordarme" la sesión dura varios días; sin él, dura una jornada y la cookie no persiste. */
-function createSession(db, userId, { remember = false } = {}) {
+async function createSession(store, userId, { remember = false } = {}) {
   const token = crypto.randomBytes(32).toString('hex');
   const expires = remember ? addDays(new Date(), config.sessionDays) : new Date(Date.now() + 12 * 60 * 60 * 1000);
-  db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)').run(
-    sha256(token),
-    userId,
-    toIsoDateTime(expires),
-  );
+  await store.set('sessions', sha256(token), {
+    user_id: userId,
+    created_at: toIsoDateTime(new Date()),
+    expires_at: toIsoDateTime(expires),
+  });
   return { token, expires, persistent: remember };
 }
 
-function destroySession(db, token) {
-  if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+async function destroySession(store, token) {
+  if (token) await store.remove('sessions', sha256(token));
 }
 
 function parseCookies(header) {
@@ -56,25 +56,31 @@ function clearSessionCookie(res) {
   res.append('Set-Cookie', 'sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
 }
 
-/** Resuelve la sesión y carga req.user (y req.guardian para apoderados). */
-function authenticate(db) {
-  const findSession = db.prepare(`
-    SELECT u.id, u.username, u.role, u.full_name AS fullName, u.title, s.expires_at AS expiresAt
-    FROM sessions s JOIN users u ON u.id = s.user_id
-    WHERE s.token_hash = ? AND u.active = 1`);
-  const findGuardian = db.prepare(`
-    SELECT g.id, g.student_id AS studentId, g.full_name AS fullName, g.phone,
-           g.consent_accepted_at AS consentAcceptedAt, g.notifications_enabled AS notificationsEnabled
-    FROM guardians g WHERE g.user_id = ?`);
+const guardianView = (g) => ({
+  id: g.id,
+  studentId: g.student_id,
+  fullName: g.full_name,
+  phone: g.phone,
+  consentAcceptedAt: g.consent_accepted_at,
+  notificationsEnabled: g.notifications_enabled,
+});
 
-  return (req, res, next) => {
+/** Resuelve la sesión y carga req.user (y req.guardian para apoderados). */
+function authenticate(store) {
+  return async (req, res, next) => {
     const token = parseCookies(req.headers.cookie).sid;
     if (token) {
-      const row = findSession.get(sha256(token));
-      if (row && row.expiresAt > toIsoDateTime(new Date())) {
-        req.sessionToken = token;
-        req.user = row;
-        if (row.role === 'apoderado') req.guardian = findGuardian.get(row.id);
+      const session = await store.get('sessions', sha256(token));
+      if (session && session.expires_at > toIsoDateTime(new Date())) {
+        const user = await store.get('users', session.user_id);
+        if (user?.active) {
+          req.sessionToken = token;
+          req.user = { id: user.id, username: user.username, role: user.role, fullName: user.full_name, title: user.title };
+          if (user.role === 'apoderado') {
+            const guardian = await store.findOne('guardians', { user_id: user.id });
+            req.guardian = guardian ? guardianView(guardian) : undefined;
+          }
+        }
       }
     }
     next();
@@ -132,6 +138,7 @@ module.exports = {
   destroySession,
   setSessionCookie,
   clearSessionCookie,
+  guardianView,
   authenticate,
   requireAuth,
   requireRole,

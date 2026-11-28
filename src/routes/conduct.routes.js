@@ -1,52 +1,49 @@
 const express = require('express');
 const auth = require('../auth');
 const { HttpError, isValidIsoDate, toIsoDate, toIsoDateTime, fullName } = require('../util');
-const { assertSectionAccess, requireTerm, parseId, notifyGuardian } = require('../domain');
+const { assertSectionAccess, requireTerm, parseId, notifyGuardian, byName } = require('../domain');
 
 const TYPES = ['leve', 'moderada', 'grave'];
 
-module.exports = function conductRoutes(db) {
+module.exports = function conductRoutes(store) {
   const router = express.Router();
   router.use(auth.requireRole('docente', 'direccion'));
 
-  router.get('/conduct', (req, res) => {
+  router.get('/conduct', async (req, res) => {
     const sectionId = parseId(req.query.sectionId, 'sección');
-    const term = requireTerm(db, req.query.term);
-    assertSectionAccess(db, req.user, sectionId);
-    const items = db
-      .prepare(`
-        SELECT i.id, i.date, i.type, i.description, i.notified_at AS notifiedAt,
-               i.notified_guardian AS notifiedGuardian, s.last_names, s.first_names
-        FROM conduct_incidents i JOIN students s ON s.id = i.student_id
-        WHERE i.section_id = ? AND i.date BETWEEN ? AND ?
-        ORDER BY i.date DESC, i.id DESC`)
-      .all(sectionId, term.startDate, term.endDate);
-    const students = db
-      .prepare('SELECT id, last_names, first_names FROM students WHERE section_id = ? AND active = 1 ORDER BY last_names, first_names')
-      .all(sectionId)
-      .map((s) => ({ id: s.id, fullName: fullName(s) }));
+    const term = await requireTerm(store, req.query.term);
+    await assertSectionAccess(store, req.user, sectionId);
+    const [incidents, students] = await Promise.all([
+      store.find('conduct_incidents', { where: { section_id: sectionId } }),
+      store.find('students', { where: { section_id: sectionId } }),
+    ]);
+    const byId = new Map(students.map((s) => [s.id, s]));
+    const items = incidents
+      .filter((i) => i.date >= term.startDate && i.date <= term.endDate)
+      .sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id);
     res.json({
-      students,
+      students: students
+        .filter((s) => s.active)
+        .sort(byName)
+        .map((s) => ({ id: s.id, fullName: fullName(s) })),
       items: items.map((i) => ({
         id: i.id,
         date: i.date,
         type: i.type,
         description: i.description,
-        studentName: fullName(i),
-        notifiedAt: i.notifiedAt,
-        notifiedGuardian: i.notifiedGuardian,
+        studentName: fullName(byId.get(i.student_id)),
+        notifiedAt: i.notified_at,
+        notifiedGuardian: i.notified_guardian,
       })),
     });
   });
 
-  router.post('/conduct', (req, res) => {
+  router.post('/conduct', async (req, res) => {
     const { studentId: rawStudent, date, type, description } = req.body || {};
     const studentId = parseId(rawStudent, 'estudiante');
-    const student = db
-      .prepare('SELECT id, last_names, first_names, section_id FROM students WHERE id = ? AND active = 1')
-      .get(studentId);
-    if (!student) throw new HttpError(404, 'Estudiante no encontrado.');
-    assertSectionAccess(db, req.user, student.section_id);
+    const student = await store.get('students', studentId);
+    if (!student?.active) throw new HttpError(404, 'Estudiante no encontrado.');
+    await assertSectionAccess(store, req.user, student.section_id);
 
     if (!isValidIsoDate(date)) throw new HttpError(400, 'Fecha no válida.');
     if (date > toIsoDate(new Date())) throw new HttpError(400, 'La fecha de la incidencia no puede ser futura.');
@@ -55,27 +52,27 @@ module.exports = function conductRoutes(db) {
     if (text.length < 5) throw new HttpError(400, 'Describe lo observado (mínimo 5 caracteres).');
     if (text.length > 1000) throw new HttpError(400, 'La descripción no puede superar los 1000 caracteres.');
 
-    const created = db.transaction(() => {
-      const id = db
-        .prepare('INSERT INTO conduct_incidents (student_id, section_id, date, type, description, recorded_by) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(studentId, student.section_id, date, type, text, req.user.id).lastInsertRowid;
-      const sent = notifyGuardian(db, studentId, { kind: 'conducta', title: `Incidencia ${type}`, body: text });
-      if (sent.sent) {
-        db.prepare('UPDATE conduct_incidents SET notified_at = ?, notified_guardian = ? WHERE id = ?').run(
-          sent.at,
-          sent.guardianName,
-          id,
-        );
-      }
-      return { id, sent };
-    })();
+    const id = await store.insert('conduct_incidents', {
+      student_id: studentId,
+      section_id: student.section_id,
+      date,
+      type,
+      description: text,
+      recorded_by: req.user.id,
+      created_at: toIsoDateTime(new Date()),
+      notified_at: null,
+      notified_guardian: null,
+    });
+    const sent = await notifyGuardian(store, studentId, { kind: 'conducta', title: `Incidencia ${type}`, body: text });
+    if (sent.sent) await store.update('conduct_incidents', id, { notified_at: sent.at, notified_guardian: sent.guardianName });
+    store.clearCache('report:');
 
     res.status(201).json({
-      id: created.id,
+      id,
       notification: {
-        sent: created.sent.sent,
-        guardianName: created.sent.guardianName,
-        at: created.sent.at || toIsoDateTime(new Date()),
+        sent: sent.sent,
+        guardianName: sent.guardianName,
+        at: sent.at || toIsoDateTime(new Date()),
       },
     });
   });

@@ -2,146 +2,149 @@ const express = require('express');
 const ExcelJS = require('exceljs');
 const auth = require('../auth');
 const { fullName, round1, courseGrade, toIsoDateTime } = require('../util');
-const { RISK_AVERAGE, RISK_UNJUSTIFIED_ABSENCES, getTerms, requireTerm, resolveCurrentTerm } = require('../domain');
+const {
+  RISK_AVERAGE,
+  RISK_UNJUSTIFIED_ABSENCES,
+  getTerms,
+  getCourses,
+  requireTerm,
+  resolveCurrentTerm,
+  byName,
+} = require('../domain');
 
 const mean = (values) => (values.length ? values.reduce((sum, v) => sum + v, 0) / values.length : null);
+const REPORT_TTL = 2 * 60 * 1000;
+const dayStart = (iso) => `${iso} 00:00:00`;
+const dayEnd = (iso) => `${iso} 23:59:59`;
 
-module.exports = function reportsRoutes(db) {
+module.exports = function reportsRoutes(store) {
   const router = express.Router();
   router.use(auth.requireRole('direccion'));
 
   /** Promedios de cada estudiante activo (solo notas publicadas) en un bimestre. */
-  function studentAverages(termCode) {
-    const rows = db
-      .prepare(`
-        SELECT s.id AS studentId, s.last_names, s.first_names, c.name AS course, g.c1, g.c2, g.c3, g.c4
-        FROM grades g
-        JOIN students s ON s.id = g.student_id AND s.active = 1
-        JOIN courses c ON c.id = g.course_id
-        WHERE g.term = ? AND g.status = 'published'
-        ORDER BY s.last_names, s.first_names, c.id`)
-      .all(termCode);
+  async function studentAverages(termCode, studentsById, courseNames) {
+    const rows = (await store.find('grades', { where: { term: termCode, status: 'published' } }))
+      .filter((g) => studentsById.has(g.student_id))
+      .sort((a, b) => byName(studentsById.get(a.student_id), studentsById.get(b.student_id)) || a.course_id - b.course_id);
     const byStudent = new Map();
-    for (const r of rows) {
-      const grade = courseGrade(r);
+    for (const g of rows) {
+      const grade = courseGrade(g);
       if (grade === null) continue;
-      if (!byStudent.has(r.studentId)) byStudent.set(r.studentId, { studentId: r.studentId, name: fullName(r), grades: [] });
-      byStudent.get(r.studentId).grades.push({ course: r.course, grade });
+      if (!byStudent.has(g.student_id)) {
+        byStudent.set(g.student_id, { studentId: g.student_id, name: fullName(studentsById.get(g.student_id)), grades: [] });
+      }
+      byStudent.get(g.student_id).grades.push({ course: courseNames.get(g.course_id), grade });
     }
     return [...byStudent.values()].map((s) => ({ ...s, average: round1(mean(s.grades.map((g) => g.grade))) }));
   }
 
-  function attendancePercent(term) {
-    const row = db
-      .prepare(`
-        SELECT COUNT(*) AS total, SUM(a.status IN ('FJ', 'FI')) AS absences
-        FROM attendance a JOIN students s ON s.id = a.student_id AND s.active = 1
-        WHERE a.date BETWEEN ? AND ?`)
-      .get(term.startDate, term.endDate);
-    return row.total ? round1(((row.total - row.absences) / row.total) * 100) : null;
-  }
+  /** Registros de asistencia de un bimestre (una sola consulta por rango de fechas). */
+  const attendanceOfTerm = (term) => store.find('attendance', { range: { field: 'date', gte: term.startDate, lte: term.endDate } });
 
-  function buildReport(termCode) {
-    const term = requireTerm(db, termCode);
-    const terms = getTerms(db);
+  const percentFrom = (records) => {
+    const absences = records.filter((a) => a.status === 'FJ' || a.status === 'FI').length;
+    return records.length ? round1(((records.length - absences) / records.length) * 100) : null;
+  };
+
+  async function buildReport(termCode) {
+    const term = await requireTerm(store, termCode);
+    const terms = await getTerms(store);
     const previous = terms.find((t) => t.position === term.position - 1) || null;
 
-    const students = studentAverages(term.code);
+    const [allStudents, guardians, courses] = await Promise.all([
+      store.find('students', { where: { active: true } }),
+      store.find('guardians'),
+      getCourses(store),
+    ]);
+    const studentsById = new Map(allStudents.map((s) => [s.id, s]));
+    const guardianByStudent = new Map(guardians.map((g) => [g.student_id, g]));
+    const courseNames = new Map(courses.map((c) => [c.id, c.name]));
+
+    const students = await studentAverages(term.code, studentsById, courseNames);
     const average = students.length ? round1(mean(students.map((s) => s.average))) : null;
-    const previousStudents = previous ? studentAverages(previous.code) : [];
+    const previousStudents = previous ? await studentAverages(previous.code, studentsById, courseNames) : [];
     const previousAverage = previousStudents.length ? round1(mean(previousStudents.map((s) => s.average))) : null;
 
-    const attendance = attendancePercent(term);
-    const previousAttendance = previous ? attendancePercent(previous) : null;
-
-    const unjustified = new Map(
-      db
-        .prepare(`
-          SELECT a.student_id AS studentId, COUNT(*) AS n FROM attendance a
-          WHERE a.status = 'FI' AND a.date BETWEEN ? AND ? GROUP BY a.student_id`)
-        .all(term.startDate, term.endDate)
-        .map((r) => [r.studentId, r.n]),
+    const attendanceByTermAll = await Promise.all(
+      terms.map(async (t) => ({ term: t.code, records: (await attendanceOfTerm(t)).filter((a) => studentsById.has(a.student_id)) })),
     );
-    const activeStudents = db
-      .prepare(`
-        SELECT s.id, s.last_names, s.first_names, g.id AS guardianId, g.full_name AS guardianName, g.phone
-        FROM students s LEFT JOIN guardians g ON g.student_id = s.id
-        WHERE s.active = 1 ORDER BY s.last_names, s.first_names`)
-      .all();
+    const recordsOf = (code) => attendanceByTermAll.find((t) => t.term === code)?.records || [];
+    const attendance = percentFrom(recordsOf(term.code));
+    const previousAttendance = previous ? percentFrom(recordsOf(previous.code)) : null;
+
+    const unjustified = new Map();
+    for (const a of recordsOf(term.code)) {
+      if (a.status === 'FI') unjustified.set(a.student_id, (unjustified.get(a.student_id) || 0) + 1);
+    }
     const averageByStudent = new Map(students.map((s) => [s.studentId, s.average]));
 
     const atRisk = [];
-    for (const s of activeStudents) {
+    for (const s of [...allStudents].sort(byName)) {
       const studentAverage = averageByStudent.get(s.id) ?? null;
       const absences = unjustified.get(s.id) || 0;
       const reasons = [];
       if (studentAverage !== null && studentAverage < RISK_AVERAGE) reasons.push(`Promedio menor a ${RISK_AVERAGE}`);
       if (absences > RISK_UNJUSTIFIED_ABSENCES) reasons.push(`Más de ${RISK_UNJUSTIFIED_ABSENCES} faltas injustificadas`);
       if (reasons.length) {
+        const g = guardianByStudent.get(s.id);
         atRisk.push({
           studentId: s.id,
           name: fullName(s),
           average: studentAverage,
           unjustifiedAbsences: absences,
           reasons,
-          guardian: s.guardianId ? { id: s.guardianId, name: s.guardianName, phone: s.phone } : null,
+          guardian: g ? { id: g.id, name: g.full_name, phone: g.phone } : null,
         });
       }
     }
 
-    const courseRows = db
-      .prepare(`
-        SELECT c.name AS course, g.c1, g.c2, g.c3, g.c4
-        FROM grades g JOIN students s ON s.id = g.student_id AND s.active = 1 JOIN courses c ON c.id = g.course_id
-        WHERE g.term = ? AND g.status = 'published'`)
-      .all(term.code);
     const byCourse = new Map();
-    for (const r of courseRows) {
-      const grade = courseGrade(r);
-      if (grade === null) continue;
-      byCourse.set(r.course, [...(byCourse.get(r.course) || []), grade]);
+    for (const s of students) {
+      for (const g of s.grades) byCourse.set(g.course, [...(byCourse.get(g.course) || []), g.grade]);
     }
-    const courses = [...byCourse.entries()]
+    const courseAverages = [...byCourse.entries()]
       .map(([name, grades]) => ({ name, average: round1(mean(grades)) }))
       .sort((a, b) => b.average - a.average);
 
-    const notif = db
-      .prepare(`
-        SELECT COUNT(*) AS total,
-               SUM(delivered_at IS NOT NULL AND (julianday(delivered_at) - julianday(created_at)) <= 1) AS timely
-        FROM notifications WHERE date(created_at) BETWEEN ? AND ?`)
-      .get(term.startDate, term.endDate);
+    const notifications = await store.find('notifications', {
+      range: { field: 'created_at', gte: dayStart(term.startDate), lte: dayEnd(term.endDate) },
+    });
+    const timely = notifications.filter((n) => {
+      if (!n.delivered_at) return false;
+      return new Date(n.delivered_at.replace(' ', 'T')) - new Date(n.created_at.replace(' ', 'T')) <= 24 * 60 * 60 * 1000;
+    }).length;
 
     return {
       term: term.code,
       previousTerm: previous?.code ?? null,
       generatedAt: toIsoDateTime(new Date()),
-      activeStudents: activeStudents.length,
+      activeStudents: allStudents.length,
       average,
       averageDelta: average !== null && previousAverage !== null ? round1(average - previousAverage) : null,
       attendance,
       attendanceDelta: attendance !== null && previousAttendance !== null ? round1(attendance - previousAttendance) : null,
       atRisk,
       notifications: {
-        total: notif.total,
-        timelyPercent: notif.total ? Math.round(((notif.timely || 0) / notif.total) * 100) : null,
+        total: notifications.length,
+        timelyPercent: notifications.length ? Math.round((timely / notifications.length) * 100) : null,
       },
-      courses,
-      attendanceByTerm: terms
-        .map((t) => ({ term: t.code, percent: attendancePercent(t) }))
-        .filter((t) => t.percent !== null),
+      courses: courseAverages,
+      attendanceByTerm: attendanceByTermAll.map((t) => ({ term: t.term, percent: percentFrom(t.records) })).filter((t) => t.percent !== null),
       students,
     };
   }
 
-  router.get('/performance', (req, res) => {
-    const term = req.query.term ? requireTerm(db, req.query.term) : resolveCurrentTerm(db);
-    res.json(buildReport(term.code));
+  /** El reporte recorre varias colecciones: se guarda en caché unos minutos (se invalida al guardar datos). */
+  const reportFor = (termCode) => store.cached(`report:${termCode}`, REPORT_TTL, () => buildReport(termCode));
+
+  router.get('/performance', async (req, res) => {
+    const term = req.query.term ? await requireTerm(store, req.query.term) : await resolveCurrentTerm(store);
+    res.json(await reportFor(term.code));
   });
 
   router.get('/performance.xlsx', async (req, res) => {
-    const term = req.query.term ? requireTerm(db, req.query.term) : resolveCurrentTerm(db);
-    const report = buildReport(term.code);
+    const term = req.query.term ? await requireTerm(store, req.query.term) : await resolveCurrentTerm(store);
+    const report = await reportFor(term.code);
 
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "College Saint Mary's";

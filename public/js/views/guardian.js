@@ -3,6 +3,7 @@ import {
   fmtNumber,
 } from '../lib.js';
 import { threadHtml } from './chat.js';
+import { pushStatus, enablePush } from '../push.js';
 
 const NAV = [
   { path: 'inicio', label: 'Inicio', icon: 'home' },
@@ -117,7 +118,7 @@ const FILTERS = [['', 'Todas'], ['asistencia', 'Asistencia'], ['conducta', 'Cond
 async function avisos(root, ctx) {
   let kind = '';
   async function draw() {
-    const data = await api.get(`/guardian/notifications?${qs({ kind })}`);
+    const [data, push] = await Promise.all([api.get(`/guardian/notifications?${qs({ kind })}`), pushStatus().catch(() => 'unsupported')]);
     const today = data.items.filter((n) => n.createdAt.startsWith(data.today));
     const older = data.items.filter((n) => !n.createdAt.startsWith(data.today));
     const card = (n) => {
@@ -132,12 +133,29 @@ async function avisos(root, ctx) {
       active: 'avisos',
       header: subHeader('Notificaciones', html`<button class="btn btn-ghost" id="read-all">Marcar leídas</button>`),
       main: html`
+        ${push === 'default' ? html`
+          <div class="alert" style="background:#e5f2e9;border:1px solid #b9dcc6;justify-content:space-between">
+            <span>${icon('bell', 18)} Recibe los avisos en tu celular, aunque no tengas la página abierta.</span>
+            <button class="btn btn-primary" id="enable-push">Activar</button>
+          </div>` : ''}
+        ${push === 'denied' ? html`<div class="alert">Bloqueaste las notificaciones del navegador. Puedes habilitarlas desde los ajustes del sitio.</div>` : ''}
         <div class="filters" style="padding:0;margin:-4px 0 0">${FILTERS.map(([value, label]) => html`<button data-kind="${value}" aria-pressed="${String(value === kind)}">${label}</button>`)}</div>
         ${today.length ? html`<span class="group-label">Hoy</span>${today.map(card)}` : ''}
         ${older.length ? html`<span class="group-label" style="padding-top:8px">Anteriores</span>${older.map(card)}` : ''}
         ${data.items.length ? '' : html`<div class="empty">No tienes notificaciones.</div>`}`,
     });
     $$('[data-kind]', root).forEach((b) => b.addEventListener('click', () => { kind = b.dataset.kind; draw(); }));
+    $('#enable-push', root)?.addEventListener('click', async (event) => {
+      await withBusy(event.currentTarget, async () => {
+        try {
+          await enablePush();
+          toast('Notificaciones activadas en este dispositivo.');
+        } catch (error) {
+          toast(error.message, 'error');
+        }
+      });
+      await draw();
+    });
     $('#read-all', root).addEventListener('click', async () => {
       await api.post('/guardian/notifications/read-all');
       await draw();
